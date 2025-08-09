@@ -1,154 +1,103 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import requests
-from datetime import datetime, timedelta
+import ccxt
+import time
+from datetime import datetime
 import io
 
 # ================== SETTINGS ==================
-DEFAULT_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "LINKUSDT", "ADAUSDT"]
+DEFAULT_SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "LINK/USDT", "ADA/USDT"]
 DEFAULT_TIMEFRAMES = ["15m", "1h", "4h"]
-ROLLING_DAYS = {
-    "15m": 2,   # keep last 2 days of 15m
-    "1h": 7,    # keep last 7 days of 1h
-    "4h": 30,   # keep last 30 days of 4h
-}
 # ===============================================
 
 st.set_page_config(page_title="Bitget → Excel Logger", page_icon="📊", layout="wide")
 
 # ----------------- Helpers ------------------
 def to_naive_utc(dt_series: pd.Series) -> pd.Series:
-    """
-    Ensure timestamps are timezone-naive (required by Excel).
-    Accepts tz-aware or naive; returns naive (no tz).
-    """
+    """Ensure timestamps are timezone-naive (Excel safe)."""
     s = pd.to_datetime(dt_series, errors="coerce")
-    # If tz-aware, drop tz; if already naive, this is a no-op
     try:
         return s.dt.tz_localize(None)
     except Exception:
         return s
 
-def get_bitget_klines(symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
+# CCXT setup
+_EXCHANGE = ccxt.bitget({"enableRateLimit": True})
+CCXT_TF = {"15m": "15m", "1h": "1h", "4h": "4h"}
+
+def candles_needed(days: int, timeframe: str) -> int:
+    mins = {"15m": 15, "1h": 60, "4h": 240}[timeframe]
+    return int((days * 24 * 60) / mins) + 10
+
+def get_bitget_klines(symbol: str, timeframe: str, days: int) -> pd.DataFrame:
     """
-    Fetch latest kline data from Bitget and return ascending by time.
+    Fetch a window of OHLCV using ccxt, paginating until we have 'days' worth.
+    Returns ascending by time with columns: time_utc, open, high, low, close, volume
     """
-    url = f"https://api.bitget.com/api/v2/market/candles?symbol={symbol}&granularity={interval}&limit={limit}"
-    r = requests.get(url, timeout=20)
-    if r.status_code != 200:
-        st.error(f"Error fetching {symbol} {interval}: {r.text}")
-        return pd.DataFrame()
-    data = r.json().get("data", [])
-    if not data:
+    tf = CCXT_TF[timeframe]
+    need = candles_needed(days, timeframe)
+    out = []
+    since_ms = int((pd.Timestamp.utcnow() - pd.Timedelta(days=days)).timestamp() * 1000)
+    limit = 500
+
+    while len(out) < need:
+        batch = _EXCHANGE.fetch_ohlcv(symbol, timeframe=tf, since=since_ms, limit=limit)
+        if not batch:
+            break
+        out.extend(batch)
+        since_ms = batch[-1][0] + 1
+        time.sleep(_EXCHANGE.rateLimit / 1000.0)
+        if len(batch) < 5:
+            break
+
+    if not out:
         return pd.DataFrame()
 
-    # Bitget returns [ts, open, high, low, close, volume, turnover]
-    df = pd.DataFrame(data, columns=["ts", "open", "high", "low", "close", "volume", "turnover"])
-
-    # Ensure numeric dtypes
+    df = pd.DataFrame(out, columns=["ts", "open", "high", "low", "close", "volume"])
     for c in ["open", "high", "low", "close", "volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    # Make a timezone-naive UTC column compatible with Excel
-    # (start with utc=True to avoid local-time ambiguity, then strip tz)
-    df["time_utc"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
-    df["time_utc"] = df["time_utc"].dt.tz_localize(None)
-
-    df = df.sort_values("time_utc").reset_index(drop=True)
-    return df
+    df["time_utc"] = pd.to_datetime(df["ts"], unit="ms", utc=True).dt.tz_localize(None)
+    return df.sort_values("time_utc").reset_index(drop=True)
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Add RSI(14), MA20, MA50, rolling High/Low(20) and % distances.
-    """
+    """Add RSI(14), MA20, MA50, High/Low(20), % distances."""
     if df.empty:
         return df.copy()
 
     out = df.copy()
-
-    # RSI(14)
     delta = out["close"].diff()
     gain = delta.clip(lower=0).rolling(14).mean()
     loss = (-delta.clip(upper=0)).rolling(14).mean()
     rs = gain / loss
     out["RSI"] = 100 - (100 / (1 + rs))
-
-    # MAs
     out["MA20"] = out["close"].rolling(20).mean()
     out["MA50"] = out["close"].rolling(50).mean()
-
-    # High/Low(20)
     out["High_20"] = out["high"].rolling(20).max()
     out["Low_20"] = out["low"].rolling(20).min()
-
-    # % from High/Low
     out["%_from_High20"] = (out["close"] - out["High_20"]) / out["High_20"] * 100
     out["%_from_Low20"] = (out["close"] - out["Low_20"]) / out["Low_20"] * 100
-
     return out
 
-def trim_rolling_history(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
-    """
-    Keep only the last N days (per timeframe) so files stay small.
-    """
-    if df.empty or "time_utc" not in df.columns:
-        return df
-    tmp = df.copy()
-    tmp["time_utc"] = to_naive_utc(tmp["time_utc"])
-    cutoff = tmp["time_utc"].max() - timedelta(days=ROLLING_DAYS.get(timeframe, 30))
-    return tmp[tmp["time_utc"] >= cutoff].copy()
-
-def merge_history(new_df: pd.DataFrame, old_df: pd.DataFrame | None) -> pd.DataFrame:
-    """
-    Append old + new, drop duplicates by time, sort ascending.
-    Force timestamps to be timezone-naive.
-    """
-    if old_df is None or old_df.empty:
-        out = new_df.copy()
-    else:
-        # Normalize old file columns (in case)
-        old = old_df.copy()
-        if "time_utc" in old.columns:
-            old["time_utc"] = to_naive_utc(old["time_utc"])
-        out = pd.concat([old, new_df], ignore_index=True)
-
-    # Ensure naive timestamps and drop dups
-    if "time_utc" in out.columns:
-        out["time_utc"] = to_naive_utc(out["time_utc"])
-        out = out.drop_duplicates(subset=["time_utc"], keep="last")
-
-    return out.sort_values("time_utc").reset_index(drop=True)
-
 def build_excel(dfs: dict) -> bytes:
-    """
-    Build an Excel with one sheet per (symbol, timeframe).
-    Also inserts a simple Close-price line chart on each sheet.
-    """
+    """Build an Excel with one sheet per (symbol, timeframe), with Close charts."""
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter", datetime_format="yyyy-mm-dd HH:MM") as writer:
         for (symbol, tf), df in dfs.items():
-            # final safety: timestamps must be naive
+            df = df.copy()
             if "time_utc" in df.columns:
-                df = df.copy()
                 df["time_utc"] = to_naive_utc(df["time_utc"])
-
-            df = trim_rolling_history(df, tf)
-
-            sheet = f"{symbol}_{tf}"
+            sheet = f"{symbol.replace('/', '')}_{tf}"
             df.to_excel(writer, sheet_name=sheet, index=False)
 
-            # Add a quick Close chart
             workbook = writer.book
             worksheet = writer.sheets[sheet]
             chart = workbook.add_chart({"type": "line"})
-            last_row = len(df) + 1  # header is row 0 in Excel writer
-
-            # time_utc is col 0; close is col 4 after our to_excel order
+            last_row = len(df) + 1
             chart.add_series({
                 "name": "Close",
                 "categories": [sheet, 1, 0, last_row, 0],
-                "values":     [sheet, 1, 4, last_row, 4],
+                "values": [sheet, 1, 4, last_row, 4],
             })
             chart.set_title({"name": f"{symbol} {tf} Close"})
             chart.set_legend({"position": "bottom"})
@@ -156,53 +105,33 @@ def build_excel(dfs: dict) -> bytes:
 
     buf.seek(0)
     return buf
+
 # -----------------------------------------------
 
-st.title("📊 Bitget → Excel (History, Append, Trimming)")
+st.title("📊 Bitget → Excel (Fresh History)")
 
-# Sidebar
+# Sidebar controls
 symbols = st.sidebar.multiselect("Select symbols", DEFAULT_SYMBOLS, DEFAULT_SYMBOLS)
 timeframes = st.sidebar.multiselect("Select timeframes", DEFAULT_TIMEFRAMES, DEFAULT_TIMEFRAMES)
-uploaded_file = st.sidebar.file_uploader("Upload previous Excel to append (optional)", type=["xlsx"])
 
-# Load existing Excel (append mode)
-existing_data: dict[tuple[str, str], pd.DataFrame] = {}
-if uploaded_file:
-    try:
-        xls = pd.ExcelFile(uploaded_file)
-        for sh in xls.sheet_names:
-            try:
-                df_old = pd.read_excel(xls, sheet_name=sh)
-                # Expect sheet like "BTCUSDT_15m"
-                if "_" in sh:
-                    tf = sh.split("_")[-1]
-                    sym = sh[: -(len(tf) + 1)]
-                    # force naive ts in existing file too
-                    if "time_utc" in df_old.columns:
-                        df_old["time_utc"] = to_naive_utc(df_old["time_utc"])
-                    existing_data[(sym, tf)] = df_old
-            except Exception as e:
-                st.warning(f"Could not read sheet {sh}: {e}")
-    except Exception as e:
-        st.error(f"Failed to open uploaded Excel: {e}")
+st.sidebar.markdown("### History window (days)")
+lookback_15m = st.sidebar.number_input("15m lookback (days)", min_value=1, max_value=14, value=3)
+lookback_1h = st.sidebar.number_input("1h lookback (days)", min_value=2, max_value=60, value=21)
+lookback_4h = st.sidebar.number_input("4h lookback (days)", min_value=7, max_value=180, value=90)
+LOOKBACK_BY_TF = {"15m": lookback_15m, "1h": lookback_1h, "4h": lookback_4h}
 
+# Main fetch button
 if st.button("🚀 Fetch & Build Excel"):
     all_dfs: dict[tuple[str, str], pd.DataFrame] = {}
-
     for sym in symbols:
         for tf in timeframes:
             st.write(f"Fetching **{sym} {tf}** …")
-            df_new = get_bitget_klines(sym, tf)
+            df_new = get_bitget_klines(sym, tf, days=LOOKBACK_BY_TF[tf])
             if df_new.empty:
                 st.warning(f"No data for {sym} {tf}")
                 continue
-
             df_new = compute_indicators(df_new)
-
-            df_old = existing_data.get((sym, tf))
-            df_merged = merge_history(df_new, df_old)
-
-            all_dfs[(sym, tf)] = df_merged
+            all_dfs[(sym, tf)] = df_new
 
     if not all_dfs:
         st.warning("No data fetched.")
