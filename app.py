@@ -1,248 +1,237 @@
 # app.py
-# Bitget -> Excel (Full list selectors + RSI, % Change)
-# Works on Streamlit Cloud. No API key needed (public OHLCV).
+# Bitget → Excel (Historical candles + RSI, % change, Volume)
+# Works on Streamlit Cloud. No API keys needed for public OHLCV.
 
 from __future__ import annotations
-
 import io
-import math
-from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Tuple
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
+import numpy as np
 import streamlit as st
 import ccxt
 
-# ---------------------------
-# Streamlit page config
-# ---------------------------
+
+# ----------------------------- UI / Page config ----------------------------- #
 st.set_page_config(
-    page_title="Bitget → Excel (Fetch + Indicators)",
-    page_icon="📊",
+    page_title="Bitget → Excel (Full history + Indicators)",
+    page_icon="📈",
     layout="wide",
 )
 
-st.title("📊 Bitget → Excel (Fetch + Indicators)")
+st.title("📈 Bitget → Excel (Full History + Indicators)")
 st.caption(
-    "Fetch historical candles from Bitget, compute RSI & % change, "
+    "Fetch historical candles from Bitget with **ccxt**, compute RSI & % change, "
     "and download a single Excel with one sheet per (symbol, timeframe)."
 )
 
-# ---------------------------
-# Helpers
-# ---------------------------
 
+# ----------------------------- Helpers (cached) ----------------------------- #
 @st.cache_data(show_spinner=False)
-def get_exchange() -> ccxt.Exchange:
-    # enableRateLimit helps avoid 429s
+def get_exchange() -> ccxt.bitget:
     ex = ccxt.bitget({"enableRateLimit": True})
     ex.load_markets()
     return ex
 
-@st.cache_data(show_spinner=False)
-def list_spot_usdt_symbols() -> List[str]:
-    ex = get_exchange()
-    symbols = []
-    for sym, info in ex.markets.items():
-        # Keep spot USDT pairs (e.g., BTC/USDT)
-        if info.get("spot") and sym.endswith("/USDT"):
-            symbols.append(sym)
-    symbols.sort()
-    return symbols
 
 @st.cache_data(show_spinner=False)
-def list_supported_timeframes() -> List[str]:
+def get_bitget_symbols() -> List[str]:
     ex = get_exchange()
-    # ccxt exposes exchange.timeframes for supported OHLCV frames
-    # If empty, fallback to common ones.
-    tf_map = ex.timeframes or {}
-    if tf_map:
-        # return the keys in a friendly order
-        order = ["1m","3m","5m","15m","30m","1h","2h","4h","6h","8h","12h","1d","3d","1w","1M"]
-        return [t for t in order if t in tf_map]
-    return ["15m", "1h", "4h", "1d"]
+    # Spot USDT pairs only, sorted.
+    return sorted([s for s in ex.symbols if s.endswith("/USDT") and ":" not in s])
 
-def tf_to_ms(tf: str) -> int:
-    # Convert timeframe string to milliseconds
-    unit = tf[-1]
-    n = int(tf[:-1])
-    if unit == "m":
-        return n * 60_000
-    if unit == "h":
-        return n * 60 * 60_000
-    if unit == "d":
-        return n * 24 * 60 * 60_000
-    if unit == "w":
-        return n * 7 * 24 * 60 * 60_000
-    if unit == "M":
-        # approximate month as 30d for paging purposes
-        return n * 30 * 24 * 60 * 60_000
-    raise ValueError(f"Unsupported timeframe: {tf}")
 
-def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+@st.cache_data(show_spinner=False)
+def get_bitget_timeframes() -> List[str]:
+    ex = get_exchange()
+    if getattr(ex, "timeframes", None):
+        return sorted(ex.timeframes.keys())
+    # Fallback (ccxt normally exposes timeframes)
+    return ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "1w", "1M"]
+
+
+# ----------------------------- Indicators ---------------------------------- #
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
     up = delta.clip(lower=0).ewm(alpha=1/period, adjust=False).mean()
-    down = (-delta).clip(lower=0).ewm(alpha=1/period, adjust=False).mean()
+    down = -delta.clip(upper=0).ewm(alpha=1/period, adjust=False).mean()
     rs = up / down
     return 100 - (100 / (1 + rs))
 
-def fetch_ohlcv_all(
+
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out["rsi"] = rsi(out["close"])
+    out["pct_change"] = out["close"].pct_change() * 100.0
+    return out
+
+
+# ----------------------------- Data fetching -------------------------------- #
+def millis(dt: datetime) -> int:
+    return int(dt.timestamp() * 1000)
+
+
+def fetch_ohlcv_full(
+    ex: ccxt.Exchange,
     symbol: str,
     timeframe: str,
-    since_ms: int,
-    until_ms: int,
+    days: int,
     limit_per_call: int = 1000,
 ) -> pd.DataFrame:
-    """Page through OHLCV from 'since_ms' until 'until_ms'."""
-    ex = get_exchange()
-    all_rows: List[List[float]] = []
-    tf_ms = tf_to_ms(timeframe)
-    cursor = since_ms
-    safety = 0
-    while cursor < until_ms and safety < 800:  # safety bound
-        try:
-            batch = ex.fetch_ohlcv(symbol, timeframe=timeframe, since=cursor, limit=limit_per_call)
-        except Exception as e:
-            # 404 or symbol/tf not supported, etc.
-            raise RuntimeError(f"fetch_ohlcv failed for {symbol} {timeframe}: {e}")
-        if not batch:
+    """
+    Pulls a rolling window of OHLCV for `days` back from now.
+    Returns a DataFrame with columns: time, open, high, low, close, volume.
+    """
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=days)
+    since = millis(start)
+
+    frames = []
+    while True:
+        candles = ex.fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=limit_per_call)
+        if not candles:
             break
-        all_rows.extend(batch)
-        # Advance cursor to last candle + 1 tf to avoid overlap
-        last_ts = batch[-1][0]
-        cursor = max(cursor + tf_ms, last_ts + tf_ms)
-        safety += 1
 
-    if not all_rows:
-        return pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
+        chunk = pd.DataFrame(
+            candles, columns=["time", "open", "high", "low", "close", "volume"]
+        )
+        frames.append(chunk)
 
-    df = pd.DataFrame(all_rows, columns=["timestamp","open","high","low","close","volume"])
-    # Convert to timezone-naive datetime for Excel
-    df["time"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True).tz_convert(None)
-    df = df[["time","open","high","low","close","volume"]]
-    df = df.sort_values("time").reset_index(drop=True)
+        # Move forward: next "since" just after last returned candle
+        last_ts = candles[-1][0]
+        # If last candle didn't advance (rare), break to avoid infinite loop
+        if last_ts <= since:
+            break
+        since = last_ts + 1
+
+        # Stop if we already crossed "now"
+        if last_ts >= millis(end):
+            break
+
+    if not frames:
+        return pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume"])
+
+    df = pd.concat(frames, ignore_index=True).drop_duplicates(subset=["time"])
+    # Make datetime **timezone-naive** for Excel (fixes the Excel tz error)
+    dt_utc = pd.to_datetime(df["time"], unit="ms", utc=True)
+    df["time"] = dt_utc.tz_convert(None)
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=["close"]).sort_values("time").reset_index(drop=True)
     return df
 
-def build_excel(dfs: Dict[Tuple[str,str], pd.DataFrame]) -> bytes:
-    """Create a single Excel file; each sheet is SYMBOL_TF."""
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+
+# ----------------------------- Excel builder -------------------------------- #
+def to_excel_bytes(dfs: Dict[Tuple[str, str], pd.DataFrame]) -> bytes:
+    """
+    Builds a single Excel (one sheet per (symbol, timeframe)).
+    Ensures all datetimes are timezone-naive before writing.
+    """
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="xlsxwriter", datetime_format="yyyy-mm-dd hh:mm:ss") as writer:
         for (symbol, tf), df in dfs.items():
             if df.empty:
                 continue
-            # Add indicators
-            df2 = df.copy()
-            df2["pct_change"] = df2["close"].pct_change() * 100
-            df2["rsi_14"] = compute_rsi(df2["close"], period=14)
-            sheet_name = f"{symbol.replace('/','')}_{tf}"
-            # Excel sheet names max 31 chars
-            if len(sheet_name) > 31:
-                sheet_name = sheet_name[:31]
-            df2.to_excel(writer, sheet_name=sheet_name, index=False)
-    return output.getvalue()
+            safe = df.copy()
+            # Double-ensure tz-naive:
+            if pd.api.types.is_datetime64_any_dtype(safe["time"]):
+                # If tz-aware, remove tz; if already naive, this is a no-op
+                if getattr(safe["time"].dt, "tz", None) is not None:
+                    safe["time"] = safe["time"].dt.tz_localize(None)
+            sheet = f"{symbol.replace('/','')}_{tf}"
+            # Excel sheet name limit 31 chars:
+            sheet = (sheet[:28] + "...") if len(sheet) > 31 else sheet
+            safe.to_excel(writer, sheet_name=sheet, index=False)
+    return buf.getvalue()
 
-# ---------------------------
-# Sidebar controls
-# ---------------------------
 
+# ----------------------------- Sidebar (selectors) -------------------------- #
 with st.sidebar:
     st.header("Settings")
-
-    # Symbols selector (populated from Bitget spot USDT list)
-    all_symbols = list_spot_usdt_symbols()
-    default_syms = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "LINK/USDT", "ADA/USDT"]
-    default_syms = [s for s in default_syms if s in all_symbols]
-
+    # Symbols
     symbols = st.multiselect(
-        "Select symbols",
-        options=all_symbols,
-        default=default_syms,
-        placeholder="Type to search (e.g., XRP/USDT)…",
-        help="All Bitget spot /USDT pairs are listed. You can type to filter.",
+        "Select symbols (type to add more, e.g., XRP/USDT)",
+        options=get_bitget_symbols(),
+        default=["BTC/USDT", "ETH/USDT", "SOL/USDT", "LINK/USDT", "ADA/USDT"],
     )
 
-    # Optional manual add
-    manual_sym = st.text_input("Add symbol manually (optional, e.g., XRP/USDT)")
-    if manual_sym:
-        manual_sym = manual_sym.strip().upper()
-        if manual_sym and manual_sym not in symbols:
-            symbols.append(manual_sym)
-
-    # Timeframes selector (populated from exchange.timeframes)
-    all_tfs = list_supported_timeframes()
-    default_tfs = [t for t in ["15m", "1h", "4h"] if t in all_tfs]
-
+    # Timeframes
+    available_tfs = get_bitget_timeframes()
+    default_tfs = [tf for tf in ["15m", "1h", "4h"] if tf in available_tfs]
     timeframes = st.multiselect(
         "Select timeframes",
-        options=all_tfs,
-        default=default_tfs,
-        help="Timeframes supported by Bitget via ccxt.",
+        options=available_tfs,
+        default=default_tfs or available_tfs[:3],
     )
 
-    # Lookback window per timeframe (days)
-    st.subheader("History window (days)")
-    lb_15m = st.number_input("15m lookback (days)", min_value=1, max_value=14, value=3, step=1)
-    lb_1h  = st.number_input("1h lookback (days)",  min_value=1, max_value=60, value=21, step=1)
-    lb_4h  = st.number_input("4h lookback (days)",  min_value=1, max_value=180, value=90, step=1)
+    st.markdown("### History window (days)")
+    lookbacks: Dict[str, int] = {}
+    for tf in timeframes:
+        default_days = 3 if tf == "15m" else 21 if tf == "1h" else 90 if tf == "4h" else 30
+        lookbacks[tf] = int(
+            st.number_input(f"{tf} lookback (days)", min_value=1, max_value=365, value=default_days, step=1)
+        )
 
-    # Map each tf to its chosen lookback (days). If a tf isn't listed, default to 7d.
-    tf_lookback_days: Dict[str, int] = {tf: 7 for tf in timeframes}
-    if "15m" in timeframes: tf_lookback_days["15m"] = lb_15m
-    if "1h"  in timeframes: tf_lookback_days["1h"]  = lb_1h
-    if "4h"  in timeframes: tf_lookback_days["4h"]  = lb_4h
 
-# ---------------------------
-# Main action
-# ---------------------------
-
-if st.button("🚀 Fetch & Build Excel", use_container_width=True):
-    if not symbols:
-        st.warning("Please select at least one symbol.")
-        st.stop()
-    if not timeframes:
-        st.warning("Please select at least one timeframe.")
+# ----------------------------- Main action ---------------------------------- #
+if st.button("🚀 Fetch & Build Excel", type="primary", use_container_width=True):
+    if not symbols or not timeframes:
+        st.error("Please select at least one symbol and one timeframe.")
         st.stop()
 
-    results: Dict[Tuple[str,str], pd.DataFrame] = {}
-    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    ex = get_exchange()
+    results: Dict[Tuple[str, str], pd.DataFrame] = {}
+
+    progress = st.progress(0.0)
+    tasks = len(symbols) * len(timeframes)
+    done = 0
 
     for sym in symbols:
-        st.markdown(f"**Fetching `{sym}`…**")
-        for tf in timeframes:
-            st.write(f"Fetching **{sym} {tf}** …")
-            days = tf_lookback_days.get(tf, 7)
-            since_ms = now_ms - days * 24 * 60 * 60 * 1000
-            try:
-                df = fetch_ohlcv_all(sym, tf, since_ms, now_ms)
-            except Exception as e:
-                st.error(f"Error fetching {sym} {tf}: {e}")
-                df = pd.DataFrame(columns=["time","open","high","low","close","volume"])
-
-            if df.empty:
-                st.warning(f"No data for {sym} {tf}")
-            else:
-                # quick stats preview
-                last = df.iloc[-1]
-                st.write(
-                    f"Rows: {len(df)} | Last: {last['time']} "
-                    f"Close: {last['close']:.4f} | Volume: {last['volume']:.4f}"
-                )
-                results[(sym, tf)] = df
+        st.subheader(sym)
+        cols = st.columns(len(timeframes))
+        for i, tf in enumerate(timeframes):
+            with cols[i]:
+                st.write(f"Fetching **{tf}** …")
+                try:
+                    df = fetch_ohlcv_full(ex, sym, tf, lookbacks.get(tf, 30))
+                    if df.empty:
+                        st.warning(f"No data for {sym} {tf}")
+                        continue
+                    df = add_indicators(df)
+                    results[(sym, tf)] = df
+                    st.success(f"{len(df):,} rows")
+                except Exception as e:
+                    st.error(f"Error fetching {sym} {tf}: {e}")
+                finally:
+                    done += 1
+                    progress.progress(done / tasks)
 
     if not results:
-        st.error("Nothing to write. Check symbols/timeframes and try again.")
+        st.error("No data collected. Please adjust selections and try again.")
         st.stop()
 
-    st.success(f"Fetched {len(results)} sheet(s). Building Excel…")
-    excel_bytes = build_excel(results)
+    # Build Excel
+    try:
+        excel_bytes = to_excel_bytes(results)
+    except Exception as e:
+        st.error(f"Error while building Excel: {e}")
+        st.stop()
 
-    fname = f"bitget_excel_{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}.xlsx"
+    # Download button
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    filename = f"bitget_data_{ts}.xlsx"
+    st.success("✅ Excel file ready.")
     st.download_button(
-        label="⬇️ Download Excel",
+        "⬇️ Download Excel",
         data=excel_bytes,
-        file_name=fname,
+        file_name=filename,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
 
-    st.info("Tip: Add this page to your Home Screen for one-tap access.")
+# Helpful footer
+st.caption(
+    "Tip: If a dropdown shows *No results*, your options list would be empty. "
+    "This app fetches symbols/timeframes **before** rendering, so you should always see results now."
+)
