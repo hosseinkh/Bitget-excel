@@ -38,6 +38,7 @@ def fetch_df(ex: ccxt.bitget, symbol: str, timeframe: str, limit: int = CANDLE_L
     df = pd.DataFrame(data, columns=["ts","open","high","low","close","volume"])
     df["time_utc"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
     df = df[["time_utc","open","high","low","close","volume"]]
+    df["time_utc"] = df["time_utc"].dt.tz_localize(None)  # make naive (Excel-friendly)
     df["rsi14"] = rsi(df["close"])
     df["pct_change"] = df["close"].pct_change() * 100.0
     try:
