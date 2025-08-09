@@ -10,20 +10,24 @@ import streamlit as st
 import ccxt
 
 # ----------------------------
-# Page
+# Page setup
 # ----------------------------
-st.set_page_config(page_title="Bitget → Excel (RSI, Volume, % Change)", page_icon="📈", layout="wide")
+st.set_page_config(
+    page_title="Bitget → Excel (RSI, Volume, % Change)",
+    page_icon="📈",
+    layout="wide",
+)
 st.title("📊 Bitget → Excel (RSI, Volume, % Change)")
 st.caption("Pick symbols & timeframes, choose history window, then **Fetch & Build Excel**.")
 
 # ----------------------------
-# Helpers
+# Utilities
 # ----------------------------
 @st.cache_data(show_spinner=False, ttl=3600)
 def list_spot_markets() -> List[str]:
     """
-    Load all Bitget spot USDT pairs. If the API fails (rate limit / network),
-    return a static fallback so the selector never shows 'No results'.
+    Load Bitget spot USDT pairs. If the API fails, return a static fallback so the
+    symbol selector is never empty.
     """
     fallback = [
         "BTC/USDT","ETH/USDT","SOL/USDT","LINK/USDT","ADA/USDT","XRP/USDT","INJ/USDT",
@@ -67,7 +71,7 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 def fetch_ohlcv(ex: ccxt.Exchange, symbol: str, timeframe: str, days: int) -> pd.DataFrame:
     """
     Fetch OHLCV for symbol/timeframe going back 'days' days.
-    Returns columns: time (UTC), open, high, low, close, volume.
+    Returns columns: time (UTC tz-aware), open, high, low, close, volume.
     """
     tf_min = timeframe_minutes(timeframe)
     est = int(np.ceil(days * 24 * 60 / tf_min)) + 10
@@ -79,40 +83,50 @@ def fetch_ohlcv(ex: ccxt.Exchange, symbol: str, timeframe: str, days: int) -> pd
         return pd.DataFrame()
 
     df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
-    df["time"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+    df["time"] = pd.to_datetime(df["ts"], unit="ms", utc=True)  # tz-aware UTC
     df = df.drop(columns=["ts"]).set_index("time").sort_index()
     df = df[~df.index.duplicated(keep="last")]
     return df.reset_index()
 
 def build_excel(dfs: Dict[Tuple[str, str], pd.DataFrame]) -> bytes:
+    """
+    Write all (symbol, timeframe) DataFrames into one Excel file.
+    IMPORTANT: Excel can't handle tz-aware datetimes, so we strip tz before writing.
+    """
     bio = io.BytesIO()
     with pd.ExcelWriter(bio, engine="xlsxwriter") as writer:
         for (symbol, tf), df in dfs.items():
             if df.empty:
                 continue
+
+            # --- strip timezone from any datetime columns so Excel accepts them ---
+            for col in df.columns:
+                if pd.api.types.is_datetime64_any_dtype(df[col]):
+                    df[col] = pd.to_datetime(df[col]).dt.tz_localize(None)
+
             sheet = f"{symbol.replace('/','')}_{tf}"
             df.to_excel(writer, sheet_name=sheet, index=False)
     return bio.getvalue()
 
 # ----------------------------
-# Controls
+# UI controls
 # ----------------------------
 ALL_SYMBOLS = list_spot_markets()
-DEFAULT_SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "LINK/USDT", "ADA/USDT"]
+DEFAULT_SYMBOLS = [s for s in ["BTC/USDT","ETH/USDT","SOL/USDT","LINK/USDT","ADA/USDT"] if s in ALL_SYMBOLS]
 
 with st.expander("Settings", expanded=True):
     symbols = st.multiselect(
         "Select symbols",
         options=ALL_SYMBOLS,
-        default=[s for s in DEFAULT_SYMBOLS if s in ALL_SYMBOLS],
-        help="Multi-select any Bitget spot USDT pairs.",
+        default=DEFAULT_SYMBOLS or ALL_SYMBOLS[:5],
+        help="Choose any Bitget spot USDT pairs.",
     )
 
     extra = st.text_input("Add more symbols (comma separated, e.g. INJ/USDT, XRP/USDT)").strip()
     if extra:
-        add = [x.strip().upper() for x in extra.split(",") if x.strip()]
-        add = [x for x in add if x.endswith("/USDT")]
-        symbols = sorted(set(symbols + add))
+        adds = [x.strip().upper() for x in extra.split(",") if x.strip()]
+        adds = [x for x in adds if x.endswith("/USDT")]
+        symbols = sorted(set(symbols + adds))
 
     TF_OPTIONS = ["1m","5m","15m","30m","1h","4h","1d"]
     timeframes = st.multiselect(
@@ -122,13 +136,13 @@ with st.expander("Settings", expanded=True):
     )
 
     days = st.number_input(
-        "History window (days) for each selected timeframe",
+        "History window (days) fetched for each selected timeframe",
         min_value=1, max_value=60, value=3, step=1,
         help="Example: 3 days of 15m/1h/4h candles."
     )
 
 # ----------------------------
-# Action
+# Fetch & build
 # ----------------------------
 go = st.button("🚀 Fetch & Build Excel", type="primary", use_container_width=True)
 
@@ -145,13 +159,13 @@ if go:
     results: Dict[Tuple[str, str], pd.DataFrame] = {}
 
     total = len(symbols) * len(timeframes)
-    p = st.progress(0.0)
+    progress = st.progress(0.0)
     done = 0
 
     for sym in symbols:
         for tf in timeframes:
             done += 1
-            p.progress(done / total)
+            progress.progress(done / total)
             with st.spinner(f"Fetching {sym} {tf}…"):
                 try:
                     raw = fetch_ohlcv(ex, sym, tf, days)
