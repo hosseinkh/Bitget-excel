@@ -42,7 +42,11 @@ def get_bitget_klines(symbol: str, timeframe: str, days: int) -> pd.DataFrame:
     limit = 500
 
     while len(out) < need:
-        batch = _EXCHANGE.fetch_ohlcv(symbol, timeframe=tf, since=since_ms, limit=limit)
+        try:
+            batch = _EXCHANGE.fetch_ohlcv(symbol, timeframe=tf, since=since_ms, limit=limit)
+        except Exception as e:
+            st.error(f"Error fetching {symbol} {tf}: {e}")
+            return pd.DataFrame()
         if not batch:
             break
         out.extend(batch)
@@ -112,6 +116,9 @@ st.title("📊 Bitget → Excel (Fresh History)")
 
 # Sidebar controls
 symbols = st.sidebar.multiselect("Select symbols", DEFAULT_SYMBOLS, DEFAULT_SYMBOLS)
+# Auto-fix for missing slash format
+symbols = [s if "/" in s else s.replace("USDT", "/USDT") for s in symbols]
+
 timeframes = st.sidebar.multiselect("Select timeframes", DEFAULT_TIMEFRAMES, DEFAULT_TIMEFRAMES)
 
 st.sidebar.markdown("### History window (days)")
