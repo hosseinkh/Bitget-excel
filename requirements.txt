@@ -2,3 +2,4 @@ streamlit==1.36.0
 pandas==2.2.2
 ccxt==4.3.77
 xlsxwriter==3.2.0
+ccxt
