@@ -1,6 +1,6 @@
 # app.py
 # Bitget → Excel (Full Candles + Indicators + Live Snapshot)
-# v3.1 — Fully index-free; forces RangeIndex to avoid DatetimeIndex errors.
+# v3.2 — index-free (forces RangeIndex), Excel-safe timestamps, live snapshot on last row
 
 from __future__ import annotations
 import io
@@ -18,13 +18,13 @@ DEFAULT_SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "LINK/USDT", "ADA/USDT"]
 DEFAULT_TFS = ["15m", "1h", "4h"]
 RSI_PERIOD = 14
 MAX_LIMIT = 1500  # safety cap per request
-APP_VERSION = "v3.1 (index-free + Excel-safe + live snapshot)"
+APP_VERSION = "v3.2 (index-free + Excel-safe + live snapshot)"
 
 st.set_page_config(page_title="Bitget → Excel (Full Candles + Indicators)",
                    page_icon="📊", layout="wide")
 
 st.title("📊 Bitget → Excel (Full Candles + Indicators + Live Snapshot)")
-st.caption(f"{APP_VERSION} — Latest market snapshot + historical candles with RSI & candle stats. Excel-safe timestamps (no timezone info).")
+st.caption(f"{APP_VERSION} — Latest snapshot + historical candles with RSI & candle stats. Timestamps are UTC and timezone-naive (Excel-safe).")
 
 # --------------------------
 # Helpers
@@ -40,14 +40,6 @@ def list_spot_usdt_symbols() -> List[str]:
     ex = get_exchange()
     return sorted([s for s, info in ex.markets.items() if info.get("spot") and s.endswith("/USDT")])
 
-def rsi(series: pd.Series, period: int = RSI_PERIOD) -> pd.Series:
-    # Wilder-style RSI using EMA, does not require DatetimeIndex
-    d = series.diff()
-    up = d.clip(lower=0).ewm(alpha=1/period, adjust=False).mean()
-    dn = (-d.clip(upper=0)).ewm(alpha=1/period, adjust=False).mean()
-    rs = up / dn
-    return 100 - (100 / (1 + rs))
-
 def tf_to_minutes(tf: str) -> int:
     tf = tf.strip().lower()
     if tf.endswith("m"): return int(tf[:-1])
@@ -56,7 +48,7 @@ def tf_to_minutes(tf: str) -> int:
     raise ValueError(f"Unsupported timeframe: {tf}")
 
 def ms_to_naive_utc(ms: pd.Series | int | float) -> pd.Series | pd.Timestamp:
-    # Convert ms→datetime with UTC, then remove tz (Excel-safe)
+    # Convert ms→datetime with UTC, then strip tz (Excel-safe)
     return pd.to_datetime(ms, unit="ms", utc=True).tz_convert(None)
 
 def force_range_index(df: pd.DataFrame) -> pd.DataFrame:
@@ -65,6 +57,17 @@ def force_range_index(df: pd.DataFrame) -> pd.DataFrame:
         df = df.reset_index(drop=True)
     return df
 
+# ---------- Indicators (index-free) ----------
+def rsi(series: pd.Series, period: int = RSI_PERIOD) -> pd.Series:
+    # Force simple RangeIndex inside RSI to avoid any time-index dependence
+    series = series.reset_index(drop=True)
+    d = series.diff()
+    up = d.clip(lower=0).ewm(alpha=1/period, adjust=False).mean()
+    dn = (-d.clip(upper=0)).ewm(alpha=1/period, adjust=False).mean()
+    rs = up / dn
+    return 100 - (100 / (1 + rs))
+
+# ---------- Data fetch (index-free) ----------
 def fetch_ohlcv(ex: ccxt.Exchange, symbol: str, timeframe: str,
                 lookback_days: int) -> pd.DataFrame:
     """
@@ -80,22 +83,19 @@ def fetch_ohlcv(ex: ccxt.Exchange, symbol: str, timeframe: str,
 
     raw = ex.fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=candles_needed)
     if not raw:
-        return pd.DataFrame(columns=["timestamp","open","high","low","close","volume"]).pipe(force_range_index)
+        cols = ["timestamp","open","high","low","close","volume"]
+        return pd.DataFrame(columns=cols).pipe(force_range_index)
 
     df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
-    # Excel-safe datetime
-    df["timestamp"] = ms_to_naive_utc(df["timestamp"])
-    # ensure numeric
+    df["timestamp"] = ms_to_naive_utc(df["timestamp"])  # Excel-safe
     for c in ["open","high","low","close","volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    # clean + sort + force simple index
     df = (df
           .drop_duplicates(subset=["timestamp"])
           .dropna(subset=["close"])
           .sort_values("timestamp")
           .reset_index(drop=True))
-    df = force_range_index(df)
-    return df
+    return force_range_index(df)
 
 def fetch_latest_details(ex: ccxt.Exchange, symbol: str) -> dict:
     """
@@ -112,7 +112,8 @@ def fetch_latest_details(ex: ccxt.Exchange, symbol: str) -> dict:
     elif ts_val is not None:
         ts = ms_to_naive_utc(ts_val)
     else:
-        ts = pd.Timestamp.utcnow()  # naive UTC stamp
+        ts = pd.Timestamp.utcnow()  # naive UTC
+
     spread = np.nan
     if isinstance(bid, (int, float)) and isinstance(ask, (int, float)):
         spread = float(ask) - float(bid)
@@ -128,7 +129,7 @@ def fetch_latest_details(ex: ccxt.Exchange, symbol: str) -> dict:
 def merge_latest_snapshot(df: pd.DataFrame, snap: dict) -> pd.DataFrame:
     """
     Keep history as CLOSED candles; write live snapshot fields on the last row.
-    Also force RangeIndex after mutation.
+    Always returns a RangeIndex.
     """
     df = force_range_index(df)
     if df.empty:
@@ -136,30 +137,26 @@ def merge_latest_snapshot(df: pd.DataFrame, snap: dict) -> pd.DataFrame:
     for c in ["current_price","current_bid","current_ask","current_spread","current_ts"]:
         if c not in df.columns:
             df[c] = np.nan
-    # last row only
     for k, v in snap.items():
         df.loc[df.index[-1], k] = v
     return force_range_index(df)
 
 def build_candle_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Add candle color/stats, RSI(14), pct change. Index-free.
+    Add candle color/stats, RSI(14), pct change. **Fully index-free**.
     """
-    df = force_range_index(df)
+    df = df.reset_index(drop=True)        # force RangeIndex
     out = df.copy()
-    # Candle color
+
     out["candle_color"] = np.where(out["close"] >= out["open"], "green", "red")
-    # Stats
     out["body"] = out["close"] - out["open"]
     out["range"] = out["high"] - out["low"]
     out["upper_wick"] = out["high"] - out[["open", "close"]].max(axis=1)
     out["lower_wick"] = out[["open", "close"]].min(axis=1) - out["low"]
-    # % change (close-to-close)
-    out["pct_change_%"] = out["close"].pct_change() * 100
-    # RSI
-    out["rsi14"] = rsi(out["close"], RSI_PERIOD)
 
-    # Column order
+    out["pct_change_%"] = out["close"].pct_change() * 100
+    out["rsi14"] = rsi(out["close"], RSI_PERIOD)  # rsi() is index-free too
+
     cols = [
         "timestamp","open","high","low","close","volume",
         "candle_color","body","range","upper_wick","lower_wick",
@@ -169,8 +166,9 @@ def build_candle_features(df: pd.DataFrame) -> pd.DataFrame:
     for c in cols:
         if c not in out.columns:
             out[c] = np.nan
-    out = out[cols]
-    return force_range_index(out)
+
+    out = out[cols].reset_index(drop=True)  # final force
+    return out
 
 def build_excel(dfs: Dict[Tuple[str, str], pd.DataFrame]) -> bytes:
     """
@@ -180,7 +178,7 @@ def build_excel(dfs: Dict[Tuple[str, str], pd.DataFrame]) -> bytes:
     with pd.ExcelWriter(output, engine="xlsxwriter", datetime_format="yyyy-mm-dd hh:mm:ss") as writer:
         for (sym, tf), df in dfs.items():
             sheet = f"{sym.replace('/','')}_{tf}"
-            dfx = force_range_index(df.copy())
+            dfx = df.reset_index(drop=True)
             dfx.to_excel(writer, sheet_name=sheet, index=False)
             ws = writer.sheets[sheet]
             ws.freeze_panes(1, 1)
@@ -256,8 +254,8 @@ with right:
 
                             snap = fetch_latest_details(ex, sym)
                             df = merge_latest_snapshot(df, snap)
-                            df = build_candle_features(df)
-                            df = force_range_index(df)  # final guard
+                            df = build_candle_features(df)  # index-free
+                            df = df.reset_index(drop=True)  # final guard
 
                             results[(sym, tf)] = df
                             st.success(f"{len(df):,} rows")
@@ -279,4 +277,4 @@ with right:
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True,
                 )
-                st.caption("Sheets include closed candles + live snapshot on the last row. Timestamps are UTC and timezone-naive.")
+                st.caption("Sheets show closed candles; the **last row** also includes a live snapshot (`current_*` fields).")
